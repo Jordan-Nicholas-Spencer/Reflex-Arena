@@ -1,62 +1,41 @@
-using TMPro;
-using Unity.Collections;
-using Unity.Netcode;
-using UnityEngine;
+// =============================================================================
+// SessionManager.cs
+// Attached to: GameManager (in Game scene)
+// Purpose: EXTRA CREDIT — Named session displayed via NetworkVariable.
+//          All clients see the session name set by the host.
+//
+// NETWORKING:
+//   - NetworkVariable<FixedString64Bytes>: Syncs the session name across network.
+//     FixedString64Bytes is used because NetworkVariable requires value types;
+//     C# strings are reference types and cannot be used directly.
+//   - OnValueChanged callback: Clients update session display when it changes.
+//   - IsServer check: Only the host/server sets the session name.
+// =============================================================================
 
-// Attached to: GameManager (or a dedicated UI manager object)
-// Purpose: Named session display (extra credit helper).
-//
-// Summary:
-// - Server sets a session name once on spawn.
-// - Session name is shared to all clients via NetworkVariable<FixedString64Bytes>.
-// - Also optionally shows host IPv4 address on the host for convenience.
-//
-// Note:
-// This does NOT implement true discovery or Relay/Lobby. It provides a named
-// session visible to all players and can be extended later.
+using UnityEngine;
+using Unity.Netcode;
+using Unity.Collections;
+using TMPro;
 
 public class SessionManager : NetworkBehaviour
 {
     public static SessionManager Instance { get; private set; }
 
-    // =========================================================================
-    // INSPECTOR REFERENCES
-    // =========================================================================
-
     [Header("Session UI")]
-    [Tooltip("Host enters a session name before starting Host")]
-    public TMP_InputField sessionNameInput;
-
-    [Tooltip("Shows session name during gameplay")]
     public TMP_Text sessionDisplayText;
+    public TMP_Text hostIPText;
 
-    [Tooltip("Shows host IPv4 address on host for convenience")]
-    public TMP_Text hostIpText;
-
-    // =========================================================================
-    // NETWORK STATE
-    // =========================================================================
-
-    private static readonly FixedString64Bytes DefaultSessionName = "Unnamed Session";
-
-    public NetworkVariable<FixedString64Bytes> SessionName = new(
-        DefaultSessionName,
-        NetworkVariableReadPermission.Everyone,
-        NetworkVariableWritePermission.Server
-    );
-
-    // =========================================================================
-    // UNITY LIFECYCLE
-    // =========================================================================
+    /// Summary:
+    /// Session name visible to all clients. Uses FixedString64Bytes
+    /// because NetworkVariable<string> is not supported (string is a reference type).
+    /// Server sets it; clients read via OnValueChanged.
+    public NetworkVariable<FixedString64Bytes> sessionName =
+        new NetworkVariable<FixedString64Bytes>(
+            "Unnamed", NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
     private void Awake()
     {
-        if (Instance != null && Instance != this)
-        {
-            Destroy(gameObject);
-            return;
-        }
-
+        if (Instance != null && Instance != this) { Destroy(this); return; }
         Instance = this;
     }
 
@@ -64,85 +43,54 @@ public class SessionManager : NetworkBehaviour
     {
         base.OnNetworkSpawn();
 
-        SessionName.OnValueChanged += OnSessionNameChanged;
+        // Subscribe to OnValueChanged — fires when server updates the name
+        sessionName.OnValueChanged += OnSessionNameChanged;
 
         if (IsServer)
         {
-            // Set session name once when the server spawns.
-            // This is server-authoritative and replicates to all clients.
-            string name = sessionNameInput != null ? sessionNameInput.text.Trim() : "";
-
+            string name = MainMenuManager.ChosenSessionName;
             if (string.IsNullOrEmpty(name))
-            {
-                name = $"Reflex Arena {System.DateTime.Now:HH:mm}";
-            }
+                name = "Reflex Arena - " + System.DateTime.Now.ToString("HH:mm");
+            sessionName.Value = name;
 
-            SessionName.Value = new FixedString64Bytes(name);
-
-            // Host-only convenience display
-            if (hostIpText != null)
+            if (hostIPText != null)
             {
-                hostIpText.text = $"Host IP: {GetLocalIPv4()}";
-                hostIpText.gameObject.SetActive(true);
-            }
-        }
-        else
-        {
-            // Non-host clients should not see host IP field
-            if (hostIpText != null)
-            {
-                hostIpText.gameObject.SetActive(false);
+                hostIPText.text = $"Host IP: {GetLocalIP()}";
+                hostIPText.gameObject.SetActive(true);
             }
         }
 
-        UpdateSessionDisplay(SessionName.Value.ToString());
+        UpdateDisplay(sessionName.Value.ToString());
     }
 
     public override void OnNetworkDespawn()
     {
-        SessionName.OnValueChanged -= OnSessionNameChanged;
+        sessionName.OnValueChanged -= OnSessionNameChanged;
         base.OnNetworkDespawn();
     }
 
-    // =========================================================================
-    // NETWORKVARIABLE CALLBACK
-    // =========================================================================
-
-    private void OnSessionNameChanged(FixedString64Bytes previousValue, FixedString64Bytes newValue)
+    /// Summary:
+    /// OnValueChanged callback — updates display on all clients.
+    private void OnSessionNameChanged(FixedString64Bytes prev, FixedString64Bytes next)
     {
-        UpdateSessionDisplay(newValue.ToString());
+        UpdateDisplay(next.ToString());
     }
 
-    private void UpdateSessionDisplay(string sessionName)
+    private void UpdateDisplay(string name)
     {
-        if (sessionDisplayText == null) return;
-        sessionDisplayText.text = $"Session: {sessionName}";
+        if (sessionDisplayText != null)
+            sessionDisplayText.text = $"Session: {name}";
     }
 
-    // =========================================================================
-    // UTILITY
-    // =========================================================================
-
-    private static string GetLocalIPv4()
+    private string GetLocalIP()
     {
-        const string fallback = "127.0.0.1";
-
         try
         {
-            var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
-            foreach (var ip in host.AddressList)
-            {
+            foreach (var ip in System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName()).AddressList)
                 if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                {
                     return ip.ToString();
-                }
-            }
         }
-        catch (System.Exception e)
-        {
-            Debug.LogWarning($"[SessionManager] Could not get local IP: {e.Message}");
-        }
-
-        return fallback;
+        catch { }
+        return "127.0.0.1";
     }
 }

@@ -1,97 +1,64 @@
-using System.Collections.Generic;
-using TMPro;
-using UnityEngine;
-
-// Attached to: GameManager (or a dedicated UI object)
-// Purpose: Displays a shared scoreboard that all clients see.
+// =============================================================================
+// ScoreboardUI.cs
+// Attached to: GameManager (in Game scene)
+// Purpose: Updates the scoreboard overlay shown BETWEEN rounds.
+//          Driven by NetworkVariable OnValueChanged callbacks.
 //
-// Summary:
-// - Called from NetworkGameManager when Scores NetworkVariable changes.
-// - This fulfills "shared elements visible over the network" because every client
-//   renders the same server-authoritative score state.
+// NETWORKING:
+//   - This script reads from NetworkVariables via callbacks.
+//   - All clients see identical scoreboard because it's driven by
+//     server-authoritative NetworkVariables.
+// =============================================================================
+
+using UnityEngine;
+using TMPro;
 
 public class ScoreboardUI : MonoBehaviour
 {
     public static ScoreboardUI Instance { get; private set; }
 
-    // =========================================================================
-    // INSPECTOR REFERENCES
-    // =========================================================================
-
-    [Header("Score Text Elements (Player 1–4)")]
-    public TMP_Text player1Text;
-    public TMP_Text player2Text;
-    public TMP_Text player3Text;
-    public TMP_Text player4Text;
-
-    [Header("Appearance")]
-    [Tooltip("Tint used for empty player slots")]
-    public Color emptySlotColor = new Color(0.5f, 0.5f, 0.5f, 1f);
-
-    [Tooltip("Tint used for active player slots")]
-    public Color activeSlotColor = Color.white;
-
-    private TMP_Text[] _entries;
-
-    // =========================================================================
-    // UNITY LIFECYCLE
-    // =========================================================================
+    [Header("Score Text Entries")]
+    public TMP_Text scoreEntry1;
+    public TMP_Text scoreEntry2;
+    public TMP_Text scoreEntry3;
+    public TMP_Text scoreEntry4;
+    public TMP_Text scoreboardTitle;
 
     private void Awake()
     {
-        if (Instance != null && Instance != this)
-        {
-            Destroy(gameObject);
-            return;
-        }
-
+        if (Instance != null && Instance != this) { Destroy(this); return; }
         Instance = this;
-
-        _entries = new[]
-        {
-            player1Text,
-            player2Text,
-            player3Text,
-            player4Text
-        };
     }
 
-    // =========================================================================
-    // PUBLIC API
-    // =========================================================================
-
-    /// <summary>
-    /// Updates the scoreboard text for player slots 1–4.
-    /// Called on every client whenever the server updates the score NetworkVariable.
-    /// </summary>
-    public void UpdateScoreboard(
-        NetworkGameManager.ScoreData scoreData,
-        Dictionary<ulong, int> playerIndexByClientId,
-        int connectedPlayers
-    )
+    /// Summary:
+    /// Called from NetworkGameManager's OnValueChanged callback.
+    /// Updates all score entries. This runs on EVERY client because
+    /// the NetworkVariable change triggers it everywhere.
+    public void Refresh(NetworkGameManager.ScoreData wins,
+                        NetworkGameManager.ScoreData hits,
+                        int connectedPlayers,
+                        int currentRound)
     {
-        // Defensive: handle missing UI wiring gracefully
-        if (_entries == null || _entries.Length != 4)
-        {
-            Debug.LogWarning("[ScoreboardUI] Score entry references not configured.");
-            return;
-        }
+        TMP_Text[] entries = { scoreEntry1, scoreEntry2, scoreEntry3, scoreEntry4 };
 
-        // Basic display: slot index is Player #.
-        // NOTE: If you later want "clientId -> slot label", you can use playerIndexByClientId.
+        if (scoreboardTitle != null)
+            scoreboardTitle.text = $"SCOREBOARD — After Round {currentRound}";
+
         for (int i = 0; i < 4; i++)
         {
-            TMP_Text entry = _entries[i];
-            if (entry == null) continue;
+            if (entries[i] == null) continue;
 
-            bool slotActive = i < connectedPlayers;
-
-            entry.gameObject.SetActive(true);
-            entry.color = slotActive ? activeSlotColor : emptySlotColor;
-
-            entry.text = slotActive
-                ? $"Player {i + 1}: {scoreData.Get(i)}"
-                : $"Player {i + 1}: ---";
+            if (i < connectedPlayers)
+            {
+                entries[i].text = $"Player {i+1}:  {wins.Get(i)} wins  |  {hits.Get(i)} hits this round";
+                entries[i].color = Color.white;
+                entries[i].gameObject.SetActive(true);
+            }
+            else
+            {
+                entries[i].text = $"Player {i+1}: ---";
+                entries[i].color = new Color(0.4f, 0.4f, 0.4f);
+            }
         }
     }
 }

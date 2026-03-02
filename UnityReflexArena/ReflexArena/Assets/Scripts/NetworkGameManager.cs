@@ -1,648 +1,738 @@
+// =============================================================================
+// NetworkGameManager.cs
+// Attached to: GameManager (in Game scene)
+// Required Components on same GameObject: NetworkObject
+// Purpose: Server-authoritative round control, scoring, match flow.
+//
+// NETWORKING:
+//   - NetworkVariable<T>: Server-authoritative state synced to all clients.
+//     Only server writes; clients read via OnValueChanged callbacks.
+//   - [Rpc(SendTo.Server)]: Client → Server communication.
+//   - [Rpc(SendTo.ClientsAndHost)]: Server → All Clients communication.
+//   - OnNetworkSpawn(): Called when object is network-ready.
+//   - IsServer / IsClient: Authority checks before operations.
+// =============================================================================
+
 using System.Collections;
 using System.Collections.Generic;
-using TMPro;
-using Unity.Netcode;
-using Unity.Netcode.Transports.UTP;
 using UnityEngine;
+using UnityEngine.SceneManagement;
+using Unity.Netcode;
+using TMPro;
 using UnityEngine.UI;
-
-// Attached to: GameManager (empty GameObject in scene)
-// Purpose: Server-authoritative match flow for "Reflex Arena".
-//
-// Summary:
-// - Server controls round state, target spawning, scoring, and match end.
-// - Clients send click actions via RPC.
-// - Shared state is synced via NetworkVariables (clients react via OnValueChanged).
 
 public class NetworkGameManager : NetworkBehaviour
 {
+    // =========================================================================
+    // SINGLETON
+    // =========================================================================
     public static NetworkGameManager Instance { get; private set; }
 
     // =========================================================================
     // INSPECTOR REFERENCES
     // =========================================================================
-
-    [Header("UI Panels")]
-    [Tooltip("Shown before networking starts (Host/Join/Server)")]
-    public GameObject connectionPanel;
-
-    [Tooltip("Main in-game UI (play area, scoreboard, etc.)")]
-    public GameObject gamePanel;
-
-    [Tooltip("Shown when match is over")]
-    public GameObject winnerPanel;
-
     [Header("UI Text")]
-    [Tooltip("Displays current round")]
     public TMP_Text roundText;
-
-    [Tooltip("Displays current status (Waiting, Get ready, Click target, etc.)")]
-    public TMP_Text statusText;
-
-    [Tooltip("Displays match winner")]
+    public TMP_Text countdownText;
+    public TMP_Text timerText;
     public TMP_Text winnerText;
 
+    [Header("UI Panels/Overlays")]
+    public GameObject countdownObject;   // The CountdownText GameObject
+    public GameObject timerObject;       // The TimerText GameObject
+    public GameObject scoreboardOverlay;
+    public GameObject winnerPanel;
+
     [Header("UI Buttons")]
-    [Tooltip("Restarts the match after MatchOver")]
-    public Button restartButton;
-
-    [Header("Connection UI")]
-    [Tooltip("IP input for client connections (default: 127.0.0.1)")]
-    public TMP_InputField ipInputField;
-
-    public Button hostButton;
-    public Button clientButton;
-    public Button serverButton;
+    public Button playAgainButton;
+    public Button quitToMenuButton;
 
     [Header("Game Settings")]
-    [Min(1)] public int winsNeeded = 3;
-    [Min(1)] public int maxRounds = 5;
-    [Range(1, 4)] public int maxPlayersSupported = 4;
-    [Min(1)] public int minPlayersToStart = 2;
+    public int winsNeeded = 3;
+    public int maxRounds = 5;
 
-    [Header("Round Timing")]
-    [Tooltip("Seconds before the round starts (Get ready)")]
-    public float roundStartDelay = 2.0f;
+    [Header("Target Settings")]
+    [Tooltip("Exact number of targets in round 1")]
+    public int round1TargetCount = 10;
 
-    [Tooltip("Random delay before target appears")]
-    public Vector2 randomSpawnDelayRange = new Vector2(0.8f, 2.5f);
+    [Tooltip("Minimum targets in rounds after round 1")]
+    public int laterRoundsTargetMin = 10;
 
-    [Tooltip("Seconds before forcing round end if not all players clicked")]
-    public float roundTimeoutSeconds = 5.0f;
+    [Tooltip("Maximum targets in rounds after round 1")]
+    public int laterRoundsTargetMax = 15;
 
-    [Tooltip("Seconds to display round result before next round")]
-    public float roundEndDelay = 3.0f;
+    [Tooltip("Base time in seconds for each round (before target count bonus)")]
+    public float baseRoundTime = 5f;
+
+    [Tooltip("Extra seconds added per target")]
+    public float timePerTarget = 0.3f;
 
     // =========================================================================
-    // NETWORK STATE (SERVER WRITES, EVERYONE READS)
+    // NETWORK VARIABLES — Server-authoritative
+    // Only the server writes to these. All clients receive updates via
+    // OnValueChanged callbacks subscribed in OnNetworkSpawn().
+    //
+    // NetworkVariable<T> requires T to be a value type (struct) that
+    // implements INetworkSerializable and IEquatable<T>.
     // =========================================================================
 
-    public enum GameState
+    /// Summary:
+    /// Current round number (1-based). Server increments each round.    
+    public NetworkVariable<int> currentRound = new NetworkVariable<int>(
+        0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    /// Summary:
+    /// Per-player round wins (up to 4 players).
+    public NetworkVariable<ScoreData> roundWins = new NetworkVariable<ScoreData>(
+        new ScoreData(), NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    /// Summary:
+    /// Per-player hit count for the CURRENT round.
+    public NetworkVariable<ScoreData> roundHits = new NetworkVariable<ScoreData>(
+        new ScoreData(), NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    /// Summary:
+    /// Current phase of the game.
+    public NetworkVariable<GamePhase> phase = new NetworkVariable<GamePhase>(
+        GamePhase.WaitingForPlayers, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    /// Summary:
+    /// Number of connected players.
+    public NetworkVariable<int> playerCount = new NetworkVariable<int>(
+        0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    /// Summary:
+    /// Number of targets for the current round.
+    public NetworkVariable<int> targetCountThisRound = new NetworkVariable<int>(
+        10, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    /// Summary:
+    /// Time remaining in the current round (seconds).
+    public NetworkVariable<float> roundTimeRemaining = new NetworkVariable<float>(
+        0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    // =========================================================================
+    // ENUMS & STRUCTS
+    // =========================================================================
+
+    public enum GamePhase
     {
         WaitingForPlayers,
-        RoundStarting,
-        RoundActive,
-        RoundEnded,
+        Countdown,       // 3-second pre-round countdown
+        RoundActive,     // Targets visible, players shooting
+        RoundResult,     // Showing scoreboard between rounds
         MatchOver
     }
 
-    [Header("NetworkVariables — Server Authoritative")]
-    public NetworkVariable<int> CurrentRound = new(
-        0,
-        NetworkVariableReadPermission.Everyone,
-        NetworkVariableWritePermission.Server
-    );
-
-    public NetworkVariable<GameState> State = new(
-        GameState.WaitingForPlayers,
-        NetworkVariableReadPermission.Everyone,
-        NetworkVariableWritePermission.Server
-    );
-
-    public NetworkVariable<int> PlayerCount = new(
-        0,
-        NetworkVariableReadPermission.Everyone,
-        NetworkVariableWritePermission.Server
-    );
-
-    public NetworkVariable<ScoreData> Scores = new(
-        new ScoreData(),
-        NetworkVariableReadPermission.Everyone,
-        NetworkVariableWritePermission.Server
-    );
-
-    // NetworkVariable requires value type + change detection.
+    /// Summary:
+    /// Score data for up to 4 players. Must implement INetworkSerializable
+    /// so Netcode knows how to serialize it, and IEquatable so NetworkVariable
+    /// can detect when the value has actually changed.
     public struct ScoreData : INetworkSerializable, System.IEquatable<ScoreData>
     {
-        public int p0;
-        public int p1;
-        public int p2;
-        public int p3;
+        public int p0, p1, p2, p3;
 
-        public int Get(int index)
+        public int Get(int i) {
+            switch(i) { case 0: return p0; case 1: return p1; case 2: return p2; case 3: return p3; default: return 0; }
+        }
+        public void Set(int i, int v) {
+            switch(i) { case 0: p0=v; break; case 1: p1=v; break; case 2: p2=v; break; case 3: p3=v; break; }
+        }
+        public void Add(int i, int v) { Set(i, Get(i) + v); }
+
+        // INetworkSerializable: tells Netcode how to send this across the wire
+        public void NetworkSerialize<T>(BufferSerializer<T> s) where T : IReaderWriter
         {
-            return index switch
-            {
-                0 => p0,
-                1 => p1,
-                2 => p2,
-                3 => p3,
-                _ => 0
-            };
+            s.SerializeValue(ref p0);
+            s.SerializeValue(ref p1);
+            s.SerializeValue(ref p2);
+            s.SerializeValue(ref p3);
         }
 
-        public void Set(int index, int value)
-        {
-            switch (index)
-            {
-                case 0: p0 = value; break;
-                case 1: p1 = value; break;
-                case 2: p2 = value; break;
-                case 3: p3 = value; break;
-            }
-        }
-
-        public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
-        {
-            serializer.SerializeValue(ref p0);
-            serializer.SerializeValue(ref p1);
-            serializer.SerializeValue(ref p2);
-            serializer.SerializeValue(ref p3);
-        }
-
-        public bool Equals(ScoreData other)
-        {
-            return p0 == other.p0 &&
-                   p1 == other.p1 &&
-                   p2 == other.p2 &&
-                   p3 == other.p3;
-        }
+        // IEquatable: NetworkVariable uses this to detect changes
+        public bool Equals(ScoreData o) => p0==o.p0 && p1==o.p1 && p2==o.p2 && p3==o.p3;
     }
 
     // =========================================================================
-    // LOCAL (NON-NETWORKED) STATE
+    // LOCAL STATE (not synced — each instance tracks its own)
     // =========================================================================
-
-    // Server only: click data for the current round
-    private readonly Dictionary<ulong, float> _clickTimes = new();
-    private readonly Dictionary<ulong, float> _clickDistances = new();
-
-    // Client only: prevent double-clicks per round
-    private bool _localClickedThisRound;
-
-    // Server only: target spawn time for reaction time calculation
-    private float _targetSpawnTime;
-
-    // Shared mapping (maintained by server, mirrored to clients via RPC)
-    private readonly Dictionary<ulong, int> _playerIndexByClientId = new();
-    private int _nextPlayerIndex;
+    private Dictionary<ulong, int> playerIndexMap = new Dictionary<ulong, int>();
+    private int nextPlayerIndex = 0;
+    private float roundDuration = 8f; // seconds per round for targets to remain
+    private Coroutine roundTimerCoroutine;
+    private bool isSinglePlayer = false;
 
     // =========================================================================
-    // UNITY LIFECYCLE
+    // AWAKE
     // =========================================================================
-
     private void Awake()
     {
-        // Singleton setup
-        if (Instance != null && Instance != this)
-        {
-            Destroy(gameObject);
-            return;
-        }
-
+        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
         Instance = this;
-
-        // Wire buttons (safe even if panels are disabled initially)
-        hostButton.onClick.AddListener(StartHost);
-        clientButton.onClick.AddListener(StartClient);
-        serverButton.onClick.AddListener(StartServer);
-        restartButton.onClick.AddListener(OnRestartClicked);
     }
 
+    // =========================================================================
+    // START — Auto-connect based on MainMenu selection
+    // =========================================================================
+    private void Start()
+    {
+        playAgainButton.onClick.AddListener(OnPlayAgain);
+        quitToMenuButton.onClick.AddListener(OnQuitToMenu);
+
+        isSinglePlayer = MainMenuManager.IsSinglePlayer;
+
+        // Auto-start networking based on menu choice
+        switch (MainMenuManager.ChosenMode)
+        {
+            case MainMenuManager.ConnectionMode.Host:
+            case MainMenuManager.ConnectionMode.SinglePlayer:
+                NetworkManager.Singleton.StartHost();
+                break;
+
+            case MainMenuManager.ConnectionMode.Client:
+                var transport = NetworkManager.Singleton.GetComponent<Unity.Netcode.Transports.UTP.UnityTransport>();
+                transport.ConnectionData.Address = MainMenuManager.ChosenIP;
+                NetworkManager.Singleton.StartClient();
+                break;
+        }
+    }
+
+    // =========================================================================
+    // OnNetworkSpawn — Subscribe to OnValueChanged callbacks
+    //
+    // This is THE critical lifecycle method for networked objects. It's called
+    // once the object is fully registered on the network. This is where 
+    // NetworkVariable callbacks are wired up.
+    // =========================================================================
     public override void OnNetworkSpawn()
     {
         base.OnNetworkSpawn();
 
-        // Subscribe to NetworkVariable changes
-        CurrentRound.OnValueChanged += (_, v) => UpdateRoundUI(v);
-        Scores.OnValueChanged += (_, v) => UpdateScoreboardUI(v);
-        State.OnValueChanged += (_, v) => UpdateGameStateUI(v);
-        PlayerCount.OnValueChanged += (_, v) => UpdatePlayerCountUI(v);
+        // --- SUBSCRIBE TO OnValueChanged CALLBACKS ---
+        // These fire on ALL clients when the server updates the variable.
+        // Callback signature: (T previousValue, T newValue)
+        currentRound.OnValueChanged += OnRoundChanged;
+        roundWins.OnValueChanged += OnWinsChanged;
+        roundHits.OnValueChanged += OnHitsChanged;
+        phase.OnValueChanged += OnPhaseChanged;
+        playerCount.OnValueChanged += OnPlayerCountChanged;
+        roundTimeRemaining.OnValueChanged += OnTimerChanged;
 
-        // UI defaults once connected/spawned
-        connectionPanel.SetActive(false);
-        gamePanel.SetActive(true);
-        winnerPanel.SetActive(false);
-
+        // Server setup
         if (IsServer)
         {
             NetworkManager.Singleton.OnClientConnectedCallback += OnClientConnected;
             NetworkManager.Singleton.OnClientDisconnectCallback += OnClientDisconnected;
-
-            PlayerCount.Value = NetworkManager.Singleton.ConnectedClientsIds.Count;
-
+            playerCount.Value = NetworkManager.Singleton.ConnectedClientsIds.Count;
             AssignPlayerIndex(NetworkManager.Singleton.LocalClientId);
-            NotifyPlayerIndexRpc(NetworkManager.Singleton.LocalClientId, _playerIndexByClientId[NetworkManager.Singleton.LocalClientId]);
+
+            // Single player: spawn bot and start immediately
+            if (isSinglePlayer)
+            {
+                // Bot gets player index 1
+                if (!playerIndexMap.ContainsKey(999))
+                {
+                    playerIndexMap[999] = 1;
+                    nextPlayerIndex = 2;
+                }
+                playerCount.Value = 2;
+                StartCoroutine(BeginCountdown());
+            }
         }
 
-        // Force initial UI state
-        UpdateRoundUI(CurrentRound.Value);
-        UpdateScoreboardUI(Scores.Value);
-        UpdateGameStateUI(State.Value);
-        UpdatePlayerCountUI(PlayerCount.Value);
+        // Initial UI state
+        winnerPanel.SetActive(false);
+        scoreboardOverlay.SetActive(false);
+        countdownObject.SetActive(false);
+        timerObject.SetActive(false);
+        UpdateRoundText();
     }
 
     public override void OnNetworkDespawn()
     {
-        CurrentRound.OnValueChanged -= (_, _) => { };
-        Scores.OnValueChanged -= (_, _) => { };
-        State.OnValueChanged -= (_, _) => { };
-        PlayerCount.OnValueChanged -= (_, _) => { };
+        currentRound.OnValueChanged -= OnRoundChanged;
+        roundWins.OnValueChanged -= OnWinsChanged;
+        roundHits.OnValueChanged -= OnHitsChanged;
+        phase.OnValueChanged -= OnPhaseChanged;
+        playerCount.OnValueChanged -= OnPlayerCountChanged;
+        roundTimeRemaining.OnValueChanged -= OnTimerChanged;
 
         if (IsServer && NetworkManager.Singleton != null)
         {
             NetworkManager.Singleton.OnClientConnectedCallback -= OnClientConnected;
             NetworkManager.Singleton.OnClientDisconnectCallback -= OnClientDisconnected;
         }
-
         base.OnNetworkDespawn();
     }
 
     // =========================================================================
-    // CONNECTION BUTTONS
+    // SERVER: Client Connection
     // =========================================================================
-
-    private void StartHost()
-    {
-        NetworkManager.Singleton.StartHost();
-    }
-
-    private void StartServer()
-    {
-        NetworkManager.Singleton.StartServer();
-    }
-
-    private void StartClient()
-    {
-        string ip = ipInputField != null ? ipInputField.text.Trim() : "";
-        if (string.IsNullOrEmpty(ip))
-        {
-            ip = "127.0.0.1";
-        }
-
-        var transport = NetworkManager.Singleton.GetComponent<UnityTransport>();
-        transport.ConnectionData.Address = ip;
-
-        NetworkManager.Singleton.StartClient();
-    }
-
-    // =========================================================================
-    // SERVER: CONNECT/DISCONNECT
-    // =========================================================================
-
     private void OnClientConnected(ulong clientId)
     {
         if (!IsServer) return;
-
         AssignPlayerIndex(clientId);
-        PlayerCount.Value = NetworkManager.Singleton.ConnectedClientsIds.Count;
+        playerCount.Value = NetworkManager.Singleton.ConnectedClientsIds.Count;
 
-        Debug.Log($"[Server] Client {clientId} connected. Players: {PlayerCount.Value}");
+        // Send all existing mappings to the new client
+        // NOTE: We copy to a list first because BroadcastPlayerIndexRpc executes
+        // immediately on the host (which modifies playerIndexMap), and you cannot
+        // modify a Dictionary while iterating over it.
+        var existingMappings = new List<KeyValuePair<ulong, int>>(playerIndexMap);
+        foreach (var kvp in existingMappings)
+            BroadcastPlayerIndexRpc(kvp.Key, kvp.Value);
 
-        // Share mapping to all clients
-        NotifyPlayerIndexRpc(clientId, _playerIndexByClientId[clientId]);
-
-        // Send existing mappings to the newly connected client
-        foreach (var kvp in _playerIndexByClientId)
-        {
-            if (kvp.Key == clientId) continue;
-            NotifyPlayerIndexTargetRpc(kvp.Key, kvp.Value, RpcTarget.Single(clientId, RpcTargetUse.Temp));
-        }
-
-        // Start match if ready
-        if (PlayerCount.Value >= minPlayersToStart && State.Value == GameState.WaitingForPlayers)
-        {
-            StartCoroutine(StartRoundAfterDelay(roundStartDelay));
-        }
+        // Start game when 2+ players connect
+        if (!isSinglePlayer && playerCount.Value >= 2 && phase.Value == GamePhase.WaitingForPlayers)
+            StartCoroutine(BeginCountdown());
     }
 
     private void OnClientDisconnected(ulong clientId)
     {
         if (!IsServer) return;
-
-        PlayerCount.Value = NetworkManager.Singleton.ConnectedClientsIds.Count;
-        Debug.Log($"[Server] Client {clientId} disconnected. Players: {PlayerCount.Value}");
+        playerCount.Value = NetworkManager.Singleton.ConnectedClientsIds.Count;
     }
 
     private void AssignPlayerIndex(ulong clientId)
     {
-        if (_playerIndexByClientId.ContainsKey(clientId)) return;
-        if (_nextPlayerIndex >= maxPlayersSupported) return;
-
-        _playerIndexByClientId[clientId] = _nextPlayerIndex;
-        _nextPlayerIndex++;
+        if (!playerIndexMap.ContainsKey(clientId) && nextPlayerIndex < 4)
+        {
+            playerIndexMap[clientId] = nextPlayerIndex;
+            nextPlayerIndex++;
+        }
     }
 
     public int GetPlayerIndex(ulong clientId)
     {
-        return _playerIndexByClientId.TryGetValue(clientId, out int index) ? index : -1;
+        return playerIndexMap.TryGetValue(clientId, out int idx) ? idx : -1;
     }
 
     // =========================================================================
-    // RPC: PLAYER INDEX MAPPING
+    // RPCs — Player Index Sync
+    //
+    // [Rpc(SendTo.ClientsAndHost)] = Server calls this, executes on all clients.
+    // This ensures every client knows the mapping of clientId → player index.
     // =========================================================================
 
     [Rpc(SendTo.ClientsAndHost)]
-    private void NotifyPlayerIndexRpc(ulong clientId, int index)
+    private void BroadcastPlayerIndexRpc(ulong clientId, int index)
     {
-        if (!_playerIndexByClientId.ContainsKey(clientId))
-        {
-            _playerIndexByClientId[clientId] = index;
-        }
+        playerIndexMap[clientId] = index;
     }
 
-    [Rpc(SendTo.SpecifiedInParams)]
-    private void NotifyPlayerIndexTargetRpc(ulong clientId, int index, RpcParams rpcParams = default)
+    // =========================================================================
+    // OnValueChanged CALLBACKS
+    //
+    // These implement the pattern: Server updates NetworkVariable →
+    // OnValueChanged fires on all clients → clients update UI.
+    // =========================================================================
+
+    private void OnRoundChanged(int prev, int next) => UpdateRoundText();
+    private void OnWinsChanged(ScoreData prev, ScoreData next) => UpdateScoreboardValues();
+    private void OnHitsChanged(ScoreData prev, ScoreData next) { /* HUD updates in real-time via separate method */ }
+    private void OnPlayerCountChanged(int prev, int next) => UpdateRoundText();
+
+    private void OnTimerChanged(float prev, float next)
     {
-        if (!_playerIndexByClientId.ContainsKey(clientId))
+        if (timerText != null)
+            timerText.text = next.ToString("F1");
+    }
+
+    private void OnPhaseChanged(GamePhase prev, GamePhase next)
+    {
+        switch (next)
         {
-            _playerIndexByClientId[clientId] = index;
+            case GamePhase.WaitingForPlayers:
+                roundText.text = "Waiting for players...";
+                scoreboardOverlay.SetActive(false);
+                countdownObject.SetActive(false);
+                timerObject.SetActive(false);
+                winnerPanel.SetActive(false);
+                break;
+
+            case GamePhase.Countdown:
+                scoreboardOverlay.SetActive(false);
+                winnerPanel.SetActive(false);
+                countdownObject.SetActive(true);
+                timerObject.SetActive(false);
+                break;
+
+            case GamePhase.RoundActive:
+                countdownObject.SetActive(false);
+                timerObject.SetActive(true);
+                scoreboardOverlay.SetActive(false);
+                break;
+
+            case GamePhase.RoundResult:
+                timerObject.SetActive(false);
+                scoreboardOverlay.SetActive(true);
+                UpdateScoreboardValues();
+                break;
+
+            case GamePhase.MatchOver:
+                timerObject.SetActive(false);
+                scoreboardOverlay.SetActive(false);
+                winnerPanel.SetActive(true);
+                break;
         }
     }
 
     // =========================================================================
-    // UI UPDATES (CLIENT-SIDE)
+    // UI HELPERS
     // =========================================================================
 
-    private void UpdateRoundUI(int round)
+    /// Summary:
+    /// Updates round text. Shows "Round X", "Match Point: Player X",
+    /// or "Next Point Wins" as appropriate.
+    private void UpdateRoundText()
     {
-        if (round <= 0)
+        if (currentRound.Value <= 0)
         {
-            roundText.text = "Waiting to start...";
+            roundText.text = phase.Value == GamePhase.WaitingForPlayers
+                ? $"Waiting for players... ({playerCount.Value} connected)"
+                : "";
             return;
         }
 
-        roundText.text = $"Round {round} of {maxRounds}";
-    }
+        // Check for match point situations
+        ScoreData wins = roundWins.Value;
+        int playersAtMatchPoint = 0;
+        int matchPointPlayer = -1;
 
-    private void UpdateScoreboardUI(ScoreData scoreData)
-    {
-        if (ScoreboardUI.Instance == null) return;
-        ScoreboardUI.Instance.UpdateScoreboard(scoreData, _playerIndexByClientId, PlayerCount.Value);
-    }
-
-    private void UpdatePlayerCountUI(int count)
-    {
-        if (State.Value == GameState.WaitingForPlayers)
+        int activePlayers = Mathf.Min(playerCount.Value, 4);
+        for (int i = 0; i < activePlayers; i++)
         {
-            statusText.text = $"Waiting for players... ({count} connected, need {minPlayersToStart})";
+            if (wins.Get(i) == winsNeeded - 1)
+            {
+                playersAtMatchPoint++;
+                matchPointPlayer = i;
+            }
         }
+
+        if (playersAtMatchPoint > 1)
+            roundText.text = "NEXT POINT WINS";
+        else if (playersAtMatchPoint == 1)
+            roundText.text = $"MATCH POINT: Player {matchPointPlayer + 1}";
+        else
+            roundText.text = $"Round {currentRound.Value}";
     }
 
-    private void UpdateGameStateUI(GameState state)
+    private void UpdateScoreboardValues()
     {
-        switch (state)
-        {
-            case GameState.WaitingForPlayers:
-                statusText.text = $"Waiting for players... ({PlayerCount.Value} connected)";
-                winnerPanel.SetActive(false);
-                _localClickedThisRound = false;
-                break;
-
-            case GameState.RoundStarting:
-                statusText.text = "Get ready...";
-                _localClickedThisRound = false;
-                break;
-
-            case GameState.RoundActive:
-                statusText.text = "CLICK THE TARGET!";
-                _localClickedThisRound = false;
-                break;
-
-            case GameState.RoundEnded:
-                // Status text is set via RPC with round result
-                _localClickedThisRound = false;
-                break;
-
-            case GameState.MatchOver:
-                // Winner UI is set via RPC
-                _localClickedThisRound = false;
-                break;
-        }
+        if (ScoreboardUI.Instance != null)
+            ScoreboardUI.Instance.Refresh(roundWins.Value, roundHits.Value, playerCount.Value, currentRound.Value);
     }
 
     // =========================================================================
-    // SERVER: MATCH FLOW
+    // SERVER: ROUND FLOW
     // =========================================================================
 
-    private IEnumerator StartRoundAfterDelay(float delay)
+    /// Summary:
+    /// 3-second countdown before each round.
+    private IEnumerator BeginCountdown()
     {
         if (!IsServer) yield break;
 
-        State.Value = GameState.RoundStarting;
-        CurrentRound.Value++;
+        currentRound.Value++;
+        phase.Value = GamePhase.Countdown;
 
-        yield return new WaitForSeconds(delay);
+        // Determine target count: round 1 = 10, later = 10-15
+        int count = currentRound.Value == 1 ? round1TargetCount : Random.Range(laterRoundsTargetMin, laterRoundsTargetMax + 1);
+        targetCountThisRound.Value = count;
 
-        float randomDelay = Random.Range(randomSpawnDelayRange.x, randomSpawnDelayRange.y);
-        yield return new WaitForSeconds(randomDelay);
+        // Reset round hits
+        roundHits.Value = new ScoreData();
 
-        _clickTimes.Clear();
-        _clickDistances.Clear();
-
-        _targetSpawnTime = Time.time;
-
-        TargetManager.Instance.SpawnTarget();
-        State.Value = GameState.RoundActive;
-
-        ResetLocalClickTrackingRpc();
-
-        StartCoroutine(RoundTimeout(roundTimeoutSeconds));
-    }
-
-    private IEnumerator RoundTimeout(float timeout)
-    {
-        yield return new WaitForSeconds(timeout);
-
-        if (IsServer && State.Value == GameState.RoundActive)
+        // 3-second countdown displayed on all clients
+        for (int i = 3; i >= 1; i--)
         {
-            EndRound();
+            UpdateCountdownRpc(i.ToString());
+            yield return new WaitForSeconds(1f);
         }
+
+        UpdateCountdownRpc("GO!");
+        yield return new WaitForSeconds(0.4f);
+
+        // Generate random seed for target positions so all clients get same positions
+        int seed = Random.Range(0, int.MaxValue);
+
+        // Start the round
+        phase.Value = GamePhase.RoundActive;
+
+        // Tell all clients to spawn targets with the same seed
+        SpawnTargetsRpc(count, seed);
+
+        // Reset all player states (ammo, abilities) via RPC
+        ResetPlayerStatesRpc();
+
+        // Start round timer
+        float duration = baseRoundTime + (count * timePerTarget); // more targets = more time
+        roundDuration = duration;
+        roundTimeRemaining.Value = duration;
+
+        if (roundTimerCoroutine != null) StopCoroutine(roundTimerCoroutine);
+        roundTimerCoroutine = StartCoroutine(RoundTimerRoutine(duration));
+
+        // If single player, start bot
+        if (isSinglePlayer && BotPlayer.Instance != null)
+            BotPlayer.Instance.StartBotRound(count);
     }
 
-    // Called by server when a client click RPC arrives
-    private void RegisterClick(ulong clientId, float distancePx)
+    /// Summary:
+    /// Server counts down the round timer and ends when it hits 0.
+    private IEnumerator RoundTimerRoutine(float duration)
+    {
+        float remaining = duration;
+        while (remaining > 0f && phase.Value == GamePhase.RoundActive)
+        {
+            remaining -= Time.deltaTime;
+            roundTimeRemaining.Value = Mathf.Max(0f, remaining);
+            yield return null;
+        }
+
+        if (phase.Value == GamePhase.RoundActive)
+            EndRound();
+    }
+
+    // =========================================================================
+    // RPCs — Round Flow (Server → All Clients)
+    // =========================================================================
+
+    /// Summary:
+    /// [Server → Clients] Update the countdown display text.
+    [Rpc(SendTo.ClientsAndHost)]
+    private void UpdateCountdownRpc(string text)
+    {
+        if (countdownText != null)
+            countdownText.text = text;
+    }
+
+    /// Summary:
+    /// [Server → Clients] Tell all clients to spawn targets locally.
+    /// Uses a shared seed so Random.Range produces identical positions everywhere.
+    /// This is how "elements spawned on the server" work — the server decides
+    /// the seed/parameters, broadcasts them, and each client creates locally.
+    /// 
+    [Rpc(SendTo.ClientsAndHost)]
+    private void SpawnTargetsRpc(int count, int seed)
+    {
+        if (TargetManager.Instance != null)
+            TargetManager.Instance.SpawnTargets(count, seed);
+    }
+
+    /// Summary:
+    /// [Server → Clients] Reset player ammo and abilities each round.
+    [Rpc(SendTo.ClientsAndHost)]
+    private void ResetPlayerStatesRpc()
+    {
+        if (PlayerInputHandler.Instance != null)
+            PlayerInputHandler.Instance.ResetForNewRound();
+    }
+
+    // =========================================================================
+    // SERVER: Receiving Player Hits
+    //
+    // [Rpc(SendTo.Server)]: Client → Server.
+    // The client tells the server "I hit a target". The server validates
+    // and updates the NetworkVariable. This is the pattern:
+    // Client action → Server RPC → Server updates NetworkVariable → 
+    // OnValueChanged fires on all clients.
+    // =========================================================================
+
+    /// Summary:
+    /// [Client → Server] A player reports hitting a target.
+    /// Server validates and increments their hit count.
+    /// 
+    /// rpcParams.Receive.SenderClientId identifies which client sent this.
+    [Rpc(SendTo.Server)]
+    public void ReportHitRpc(RpcParams rpcParams = default)
+    {
+        ulong sender = rpcParams.Receive.SenderClientId;
+        int idx = GetPlayerIndex(sender);
+        if (idx < 0) return;
+        if (phase.Value != GamePhase.RoundActive) return;
+
+        ScoreData hits = roundHits.Value;
+        hits.Add(idx, 1);
+        roundHits.Value = hits; // Triggers OnValueChanged on all clients
+    }
+
+    /// Summary:
+    /// SERVER: Called by BotPlayer to register a bot hit.
+    public void RegisterBotHit()
     {
         if (!IsServer) return;
-        if (State.Value != GameState.RoundActive) return;
-        if (_clickTimes.ContainsKey(clientId)) return;
+        if (phase.Value != GamePhase.RoundActive) return;
 
-        float reactionTime = Time.time - _targetSpawnTime;
-        _clickTimes[clientId] = reactionTime;
-        _clickDistances[clientId] = distancePx;
-
-        Debug.Log($"[Server] Client {clientId} clicked. Time={reactionTime:F3}s Dist={distancePx:F1}px");
-
-        int expectedClicks = NetworkManager.Singleton.ConnectedClientsIds.Count;
-        if (_clickTimes.Count >= expectedClicks)
-        {
-            EndRound();
-        }
+        ScoreData hits = roundHits.Value;
+        hits.Add(1, 1); // Bot is always player index 1
+        roundHits.Value = hits;
     }
+
+    // =========================================================================
+    // SERVER: End Round — Determine winner, update scores
+    // =========================================================================
 
     private void EndRound()
     {
         if (!IsServer) return;
 
-        State.Value = GameState.RoundEnded;
-        TargetManager.Instance.HideTarget();
+        phase.Value = GamePhase.RoundResult;
 
-        if (_clickTimes.Count == 0)
+        // Hide targets on all clients
+        HideAllTargetsRpc();
+
+        // Find round winner (most hits)
+        ScoreData hits = roundHits.Value;
+        int bestHits = -1;
+        int bestPlayer = -1;
+        int activePlayers = Mathf.Min(playerCount.Value, 4);
+
+        for (int i = 0; i < activePlayers; i++)
         {
-            AnnounceRoundResultRpc("No one clicked. No winner this round.", -1);
-            StartCoroutine(StartRoundAfterDelay(roundEndDelay));
-            return;
-        }
-
-        ulong winnerClientId = 0;
-        float bestTime = float.MaxValue;
-
-        foreach (var kvp in _clickTimes)
-        {
-            ulong cid = kvp.Key;
-            float time = kvp.Value;
-
-            if (time < bestTime)
+            if (hits.Get(i) > bestHits)
             {
-                bestTime = time;
-                winnerClientId = cid;
-                continue;
-            }
-
-            if (Mathf.Approximately(time, bestTime))
-            {
-                if (_clickDistances[cid] < _clickDistances[winnerClientId])
-                {
-                    winnerClientId = cid;
-                }
+                bestHits = hits.Get(i);
+                bestPlayer = i;
             }
         }
 
-        int winnerIndex = GetPlayerIndex(winnerClientId);
-        if (winnerIndex < 0)
+        // Award round win
+        if (bestPlayer >= 0 && bestHits > 0)
         {
-            AnnounceRoundResultRpc("Winner could not be mapped to a player index.", -1);
-            StartCoroutine(StartRoundAfterDelay(roundEndDelay));
-            return;
-        }
+            ScoreData wins = roundWins.Value;
+            wins.Add(bestPlayer, 1);
+            roundWins.Value = wins; // Triggers OnValueChanged → scoreboard updates
 
-        // Update scores (NetworkVariable write)
-        ScoreData updated = Scores.Value;
-        updated.Set(winnerIndex, updated.Get(winnerIndex) + 1);
-        Scores.Value = updated;
-
-        int winnerScore = updated.Get(winnerIndex);
-
-        AnnounceRoundResultRpc($"Player {winnerIndex + 1} wins the round! ({bestTime:F3}s)", winnerIndex);
-
-        // Match win by score
-        if (winnerScore >= winsNeeded)
-        {
-            State.Value = GameState.MatchOver;
-            AnnounceMatchWinnerRpc(winnerIndex);
-            return;
-        }
-
-        // Match over by max rounds
-        if (CurrentRound.Value >= maxRounds)
-        {
-            int bestPlayer = -1;
-            int bestScore = -1;
-
-            for (int i = 0; i < maxPlayersSupported; i++)
+            // Check for match winner
+            if (wins.Get(bestPlayer) >= winsNeeded)
             {
-                int score = updated.Get(i);
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestPlayer = i;
-                }
+                phase.Value = GamePhase.MatchOver;
+                AnnounceWinnerRpc(bestPlayer);
+                return;
             }
-
-            State.Value = GameState.MatchOver;
-            AnnounceMatchWinnerRpc(bestPlayer);
-            return;
         }
 
-        StartCoroutine(StartRoundAfterDelay(roundEndDelay));
+        // Show scoreboard for 4 seconds, then start next round
+        StartCoroutine(InterRoundPause());
     }
 
-    // =========================================================================
-    // RPC: ROUND/MATCH UI MESSAGES
-    // =========================================================================
-
-    [Rpc(SendTo.ClientsAndHost)]
-    private void ResetLocalClickTrackingRpc()
+    private IEnumerator InterRoundPause()
     {
-        _localClickedThisRound = false;
-    }
-
-    [Rpc(SendTo.ClientsAndHost)]
-    private void AnnounceRoundResultRpc(string message, int winnerIndex)
-    {
-        statusText.text = message;
-        Debug.Log($"[Client] Round result: {message}");
+        // Scoreboard is shown (phase = RoundResult triggers OnPhaseChanged)
+        yield return new WaitForSeconds(4f);
+        StartCoroutine(BeginCountdown());
     }
 
     [Rpc(SendTo.ClientsAndHost)]
-    private void AnnounceMatchWinnerRpc(int winnerIndex)
+    private void HideAllTargetsRpc()
     {
-        winnerText.text = winnerIndex >= 0
-            ? $"Player {winnerIndex + 1} Wins the Match!"
-            : "Match Over!";
+        if (TargetManager.Instance != null)
+            TargetManager.Instance.ClearAllTargets();
+    }
 
-        statusText.text = "Match Over!";
+    [Rpc(SendTo.ClientsAndHost)]
+    private void AnnounceWinnerRpc(int winnerIndex)
+    {
+        winnerText.text = $"Player {winnerIndex + 1} Wins the Match!";
         winnerPanel.SetActive(true);
     }
 
     [Rpc(SendTo.ClientsAndHost)]
-    private void HideWinnerPanelRpc()
+    private void ResetPlayerMatchStatesRpc()
     {
-        winnerPanel.SetActive(false);
+        if (PlayerInputHandler.Instance != null)
+            PlayerInputHandler.Instance.ResetForNewMatch();
     }
 
     // =========================================================================
-    // CLIENT -> SERVER ACTION RPCs
+    // MULTIPLAYER INTERACTIONS: Jam & Sand
+    //
+    // These are [Rpc(SendTo.Server)] calls — clients request an action,
+    // server validates (checks if ability available), then broadcasts
+    // the effect to the targeted client(s) via [Rpc(SendTo.ClientsAndHost)].
     // =========================================================================
 
+    /// Summary:
+    /// [Client → Server] Player requests to jam opponents' guns.
+    /// Server validates and applies.
     [Rpc(SendTo.Server)]
-    public void PlayerClickRpc(float distancePx, RpcParams rpcParams = default)
+    public void RequestJamRpc(RpcParams rpcParams = default)
     {
-        ulong senderId = rpcParams.Receive.SenderClientId;
-        RegisterClick(senderId, distancePx);
+        ulong sender = rpcParams.Receive.SenderClientId;
+        // Apply jam to all OTHER players
+        ApplyJamRpc(sender);
     }
 
-    // Client-side gate to prevent double click spam
-    public bool TryLocalClickGate()
+    /// Summary:
+    /// [Server → All Clients] Apply gun jam to everyone except the sender.
+    /// Each client checks if they are the sender; if not, they get jammed.
+    [Rpc(SendTo.ClientsAndHost)]
+    private void ApplyJamRpc(ulong senderClientId)
     {
-        if (_localClickedThisRound) return false;
-        if (State.Value != GameState.RoundActive) return false;
-
-        _localClickedThisRound = true;
-        return true;
+        // Don't jam the player who sent it
+        if (NetworkManager.Singleton.LocalClientId == senderClientId) return;
+        if (PlayerInputHandler.Instance != null)
+            PlayerInputHandler.Instance.GetJammed();
     }
 
-    private void OnRestartClicked()
-    {
-        if (IsServer)
-        {
-            RestartMatch();
-            return;
-        }
-
-        RequestRestartRpc();
-    }
-
+    /// Summary:
+    /// [Client → Server] Player requests to throw pocket sand at opponents.
     [Rpc(SendTo.Server)]
-    private void RequestRestartRpc()
+    public void RequestSandRpc(RpcParams rpcParams = default)
     {
-        RestartMatch();
+        ulong sender = rpcParams.Receive.SenderClientId;
+        ApplySandRpc(sender);
     }
+
+    /// Summary:
+    /// [Server → All Clients] Apply pocket sand to everyone except sender.
+    [Rpc(SendTo.ClientsAndHost)]
+    private void ApplySandRpc(ulong senderClientId)
+    {
+        if (NetworkManager.Singleton.LocalClientId == senderClientId) return;
+        if (PocketSandEffect.Instance != null)
+            PocketSandEffect.Instance.ActivateSand();
+    }
+
+    // =========================================================================
+    // RESTART / QUIT
+    // =========================================================================
+
+    private void OnPlayAgain()
+    {
+        if (IsServer) RestartMatch();
+        else RequestRestartRpc();
+    }
+
+    /// Summary:
+    /// [Client → Server] Client requests a restart.
+    [Rpc(SendTo.Server)]
+    private void RequestRestartRpc() => RestartMatch();
 
     private void RestartMatch()
     {
         if (!IsServer) return;
+        currentRound.Value = 0;
+        roundWins.Value = new ScoreData();
+        roundHits.Value = new ScoreData();
+        phase.Value = GamePhase.WaitingForPlayers;
+        HideAllTargetsRpc();
+        HideWinnerRpc();
+        ResetPlayerMatchStatesRpc();
 
-        CurrentRound.Value = 0;
-        Scores.Value = new ScoreData();
-        State.Value = GameState.WaitingForPlayers;
+        if (playerCount.Value >= 2 || isSinglePlayer)
+            StartCoroutine(BeginCountdown());
+    }
 
-        TargetManager.Instance.HideTarget();
-        HideWinnerPanelRpc();
+    [Rpc(SendTo.ClientsAndHost)]
+    private void HideWinnerRpc() => winnerPanel.SetActive(false);
 
-        if (PlayerCount.Value >= minPlayersToStart)
-        {
-            StartCoroutine(StartRoundAfterDelay(roundStartDelay));
-        }
+    private void OnQuitToMenu()
+    {
+        // Shutdown networking and return to main menu
+        if (NetworkManager.Singleton != null)
+            NetworkManager.Singleton.Shutdown();
+        SceneManager.LoadScene("MainMenu");
     }
 }

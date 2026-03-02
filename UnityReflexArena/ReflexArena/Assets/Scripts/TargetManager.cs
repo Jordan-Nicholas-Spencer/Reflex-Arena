@@ -1,124 +1,137 @@
-using Unity.Netcode;
+// =============================================================================
+// TargetManager.cs
+// Attached to: GameManager (in Game scene)
+// Purpose: Spawns and manages target UI elements during rounds.
+//          Uses a shared random seed so all clients spawn targets at identical positions.
+//
+// NETWORKING:
+//   - Server determines spawn parameters (count, seed) and broadcasts via RPC.
+//   - Each client instantiates targets LOCALLY at the same positions (same seed = same Random).
+//   - Each player's targets are INDEPENDENT — clicking yours doesn't affect others'.
+// =============================================================================
+
+using System.Collections.Generic;
 using UnityEngine;
 
-// Attached to: GameManager (same object as NetworkGameManager)
-// Purpose: Server-authoritative target placement and visibility.
-//
-// Summary:
-// - Server chooses a random target position inside the play area.
-// - Server broadcasts the position/visibility to all clients via RPC.
-// - Clients only render what the server decides (same target placement for everyone).
-
-public class TargetManager : NetworkBehaviour
+public class TargetManager : MonoBehaviour
 {
     public static TargetManager Instance { get; private set; }
 
-    // =========================================================================
-    // INSPECTOR REFERENCES
-    // =========================================================================
+    [Header("References")]
+    [Tooltip("The target prefab (a UI Image) to instantiate")]
+    public GameObject targetPrefab;
 
-    [Header("Target")]
-    [Tooltip("Target RectTransform (UI element inside the Play Area)")]
-    public RectTransform targetRect;
+    [Tooltip("The PlayArea RectTransform (targets spawn inside this area)")]
+    public RectTransform playArea;
 
-    [Tooltip("Target GameObject that gets enabled/disabled")]
-    public GameObject targetObject;
-
-    [Header("Play Area")]
-    [Tooltip("RectTransform that defines the valid target spawn bounds")]
-    public RectTransform playAreaRect;
-
-    [Header("Placement")]
-    [Tooltip("Padding from the play area edges (prevents clipping)")]
-    [Min(0f)]
-    public float edgePaddingPx = 60f;
-
-    // =========================================================================
-    // UNITY LIFECYCLE
-    // =========================================================================
+    // Active targets this client can click
+    private List<GameObject> activeTargets = new List<GameObject>();
 
     private void Awake()
     {
-        // Singleton
-        if (Instance != null && Instance != this)
-        {
-            Destroy(gameObject);
-            return;
-        }
-
+        if (Instance != null && Instance != this) { Destroy(this); return; }
         Instance = this;
     }
 
-    // =========================================================================
-    // SERVER METHODS
-    // =========================================================================
-
-    /// <summary>
-    /// SERVER ONLY: Picks a random anchored position within the play area
-    /// and tells all clients to show the target there.
-    /// </summary>
-    public void SpawnTarget()
+    /// Summary:
+    /// Spawn targets at positions determined by the given seed.
+    /// Because all clients use the same seed, Random.Range produces
+    /// identical positions on every machine — this is how the server
+    /// ensures targets appear in the same places for everyone.
+    /// <param name="count">Number of targets to spawn</param>
+    /// <param name="seed">Random seed from the server (ensures identical positions)</param>
+    public void SpawnTargets(int count, int seed)
     {
-        if (!IsServer) return;
+        ClearAllTargets();
 
-        if (playAreaRect == null || targetRect == null || targetObject == null)
+        // Use the server-provided seed so all clients get identical positions
+        Random.State originalState = Random.state;
+        Random.InitState(seed);
+
+        float areaW = playArea.rect.width;
+        float areaH = playArea.rect.height;
+        float padding = 50f;
+        float targetSize = 70f;
+
+        // Generate non-overlapping positions
+        List<Vector2> positions = new List<Vector2>();
+        int maxAttempts = 200;
+
+        for (int i = 0; i < count; i++)
         {
-            Debug.LogError("[Server] TargetManager missing inspector references.");
-            return;
+            bool placed = false;
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                float x = Random.Range(-areaW/2 + padding, areaW/2 - padding);
+                float y = Random.Range(-areaH/2 + padding, areaH/2 - padding);
+                Vector2 candidate = new Vector2(x, y);
+
+                // Check overlap with existing targets
+                bool overlaps = false;
+                foreach (var pos in positions)
+                {
+                    if (Vector2.Distance(candidate, pos) < targetSize + 10f) // 10px gap
+                    {
+                        overlaps = true;
+                        break;
+                    }
+                }
+
+                if (!overlaps)
+                {
+                    positions.Add(candidate);
+                    placed = true;
+                    break;
+                }
+            }
+
+            // Fallback: if we couldn't find a non-overlapping spot, place anyway
+            if (!placed)
+            {
+                float x = Random.Range(-areaW/2 + padding, areaW/2 - padding);
+                float y = Random.Range(-areaH/2 + padding, areaH/2 - padding);
+                positions.Add(new Vector2(x, y));
+            }
         }
 
-        Vector2 pos = GetRandomAnchoredPosition();
-        Debug.Log($"[Server] Spawning target at ({pos.x:F0}, {pos.y:F0})");
+        // Restore original random state (so we don't affect other random calls)
+        Random.state = originalState;
 
-        ShowTargetRpc(pos.x, pos.y);
+        // Instantiate targets at the computed positions
+        foreach (var pos in positions)
+        {
+            GameObject target = Instantiate(targetPrefab, playArea);
+            RectTransform rt = target.GetComponent<RectTransform>();
+            rt.anchoredPosition = pos;
+            rt.sizeDelta = new Vector2(targetSize, targetSize);
+            target.SetActive(true);
+            activeTargets.Add(target);
+        }
     }
 
-    /// <summary>
-    /// SERVER ONLY: Hides the target on all clients.
-    /// </summary>
-    public void HideTarget()
+    /// Summary:
+    /// Remove all active targets from the screen.
+    public void ClearAllTargets()
     {
-        if (!IsServer) return;
-        HideTargetRpc();
+        foreach (var t in activeTargets)
+        {
+            if (t != null) Destroy(t);
+        }
+        activeTargets.Clear();
     }
 
-    private Vector2 GetRandomAnchoredPosition()
+    /// Summary:
+    /// Remove a specific target (when the local player clicks it).
+    public void RemoveTarget(GameObject target)
     {
-        float halfWidth = (playAreaRect.rect.width * 0.5f) - edgePaddingPx;
-        float halfHeight = (playAreaRect.rect.height * 0.5f) - edgePaddingPx;
-
-        // If play area is too small for current padding, clamp to 0 to avoid invalid ranges.
-        halfWidth = Mathf.Max(0f, halfWidth);
-        halfHeight = Mathf.Max(0f, halfHeight);
-
-        float x = Random.Range(-halfWidth, halfWidth);
-        float y = Random.Range(-halfHeight, halfHeight);
-
-        return new Vector2(x, y);
+        if (activeTargets.Contains(target))
+        {
+            activeTargets.Remove(target);
+            Destroy(target);
+        }
     }
 
-    // =========================================================================
-    // RPCs — SERVER -> ALL CLIENTS
-    // =========================================================================
-
-    /// <summary>
-    /// [Server → All Clients] Show the target at the specified anchored position.
-    /// </summary>
-    [Rpc(SendTo.ClientsAndHost)]
-    private void ShowTargetRpc(float x, float y)
-    {
-        targetRect.anchoredPosition = new Vector2(x, y);
-        targetObject.SetActive(true);
-
-        Debug.Log($"[Client] Target shown at ({x:F0}, {y:F0})");
-    }
-
-    /// <summary>
-    /// [Server → All Clients] Hide the target.
-    /// </summary>
-    [Rpc(SendTo.ClientsAndHost)]
-    private void HideTargetRpc()
-    {
-        targetObject.SetActive(false);
-    }
+    /// Summary:
+    /// Get the list of currently active targets (for bot or input checking).
+    public List<GameObject> GetActiveTargets() => activeTargets;
 }
