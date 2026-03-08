@@ -202,11 +202,9 @@ public class NetworkGameManager : NetworkBehaviour
             case MainMenuManager.ConnectionMode.Host:
             case MainMenuManager.ConnectionMode.SinglePlayer:
                 if (connectingPanel != null) connectingPanel.SetActive(false);
-                // Bind to 0.0.0.0 so other devices on the network can connect
                 var hostTransport = NetworkManager.Singleton.GetComponent<Unity.Netcode.Transports.UTP.UnityTransport>();
-                hostTransport.ConnectionData.Address = "0.0.0.0";
-                hostTransport.ConnectionData.Port = 7777;
-                hostTransport.ConnectionData.ServerListenAddress = "0.0.0.0";
+                hostTransport.SetConnectionData("0.0.0.0", 7777, "0.0.0.0");
+                Debug.Log("[Host] Listening on 0.0.0.0:7777");
                 NetworkManager.Singleton.StartHost();
                 break;
 
@@ -217,10 +215,8 @@ public class NetworkGameManager : NetworkBehaviour
                     connectingText.text = $"Connecting to {MainMenuManager.ChosenIP}...";
                 }
                 var transport = NetworkManager.Singleton.GetComponent<Unity.Netcode.Transports.UTP.UnityTransport>();
-                transport.ConnectionData.Address = MainMenuManager.ChosenIP;
-                transport.ConnectionData.Port = 7777;
+                transport.SetConnectionData(MainMenuManager.ChosenIP, 7777);
                 Debug.Log($"[Client] Attempting to connect to {MainMenuManager.ChosenIP}:7777");
-                Debug.Log($"[Client] Transport address set to: {transport.ConnectionData.Address}:{transport.ConnectionData.Port}");
                 NetworkManager.Singleton.OnClientConnectedCallback += OnLocalClientConnected;
                 NetworkManager.Singleton.OnClientDisconnectCallback += OnLocalClientFailed;
                 transport.DisconnectTimeoutMS = 10000;
