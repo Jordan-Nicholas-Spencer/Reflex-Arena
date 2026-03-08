@@ -202,6 +202,11 @@ public class NetworkGameManager : NetworkBehaviour
             case MainMenuManager.ConnectionMode.Host:
             case MainMenuManager.ConnectionMode.SinglePlayer:
                 if (connectingPanel != null) connectingPanel.SetActive(false);
+                // Bind to 0.0.0.0 so other devices on the network can connect
+                var hostTransport = NetworkManager.Singleton.GetComponent<Unity.Netcode.Transports.UTP.UnityTransport>();
+                hostTransport.ConnectionData.Address = "0.0.0.0";
+                hostTransport.ConnectionData.Port = 7777;
+                hostTransport.ConnectionData.ServerListenAddress = "0.0.0.0";
                 NetworkManager.Singleton.StartHost();
                 break;
 
