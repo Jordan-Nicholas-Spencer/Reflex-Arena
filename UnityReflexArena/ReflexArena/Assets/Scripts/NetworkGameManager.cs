@@ -47,6 +47,10 @@ public class NetworkGameManager : NetworkBehaviour
     public Button playAgainButton;
     public Button quitToMenuButton;
 
+    [Header("Connection UI")]
+    public GameObject connectingPanel;
+    public TMP_Text connectingText;
+
     [Header("Game Settings")]
     public int winsNeeded = 3;
     public int maxRounds = 5;
@@ -187,21 +191,78 @@ public class NetworkGameManager : NetworkBehaviour
 
         isSinglePlayer = MainMenuManager.IsSinglePlayer;
 
-        // Auto-start networking based on menu choice
+        // Hide all game UI until connected
+        scoreboardOverlay.SetActive(false);
+        winnerPanel.SetActive(false);
+        countdownObject.SetActive(false);
+        timerObject.SetActive(false);
+
         switch (MainMenuManager.ChosenMode)
         {
             case MainMenuManager.ConnectionMode.Host:
             case MainMenuManager.ConnectionMode.SinglePlayer:
+                if (connectingPanel != null) connectingPanel.SetActive(false);
                 NetworkManager.Singleton.StartHost();
                 break;
 
             case MainMenuManager.ConnectionMode.Client:
+                if (connectingPanel != null)
+                {
+                    connectingPanel.SetActive(true);
+                    connectingText.text = $"Connecting to {MainMenuManager.ChosenIP}...";
+                }
                 var transport = NetworkManager.Singleton.GetComponent<Unity.Netcode.Transports.UTP.UnityTransport>();
                 transport.ConnectionData.Address = MainMenuManager.ChosenIP;
+                transport.ConnectionData.Port = 7777;
+                Debug.Log($"[Client] Attempting to connect to {MainMenuManager.ChosenIP}:7777");
+                NetworkManager.Singleton.OnClientConnectedCallback += OnLocalClientConnected;
+                NetworkManager.Singleton.OnClientDisconnectCallback += OnLocalClientFailed;
+                transport.DisconnectTimeoutMS = 10000;
                 NetworkManager.Singleton.StartClient();
                 break;
         }
     }
+
+    // Summary:
+    // Called if this client fails to connect to the server.
+    // Returns to the main menu with an error message.
+    private void OnLocalClientFailed(ulong clientId)
+    {
+        if (clientId != NetworkManager.Singleton.LocalClientId) return;
+
+        Debug.LogWarning("[Client] Failed to connect to server. Returning to main menu.");
+        NetworkManager.Singleton.OnClientConnectedCallback -= OnLocalClientConnected;
+        NetworkManager.Singleton.OnClientDisconnectCallback -= OnLocalClientFailed;
+
+        // Shutdown gracefully before changing scenes
+        if (NetworkManager.Singleton.IsClient)
+            NetworkManager.Singleton.Shutdown();
+
+        // Small delay to let shutdown complete, then load menu
+        StartCoroutine(ReturnToMenuAfterDelay());
+    }
+
+    private IEnumerator ReturnToMenuAfterDelay()
+    {
+        yield return new WaitForSeconds(0.5f);
+        SceneManager.LoadScene("MainMenu");
+    }
+
+    // Summary:
+    // Called when this client successfully connects to the server.
+    // Hides the connecting panel.
+    private void OnLocalClientConnected(ulong clientId)
+    {
+        if (clientId != NetworkManager.Singleton.LocalClientId) return;
+
+        Debug.Log("[Client] Successfully connected to server.");
+        if (connectingPanel != null) connectingPanel.SetActive(false);
+
+        // Unsubscribe — we only need this once
+        NetworkManager.Singleton.OnClientConnectedCallback -= OnLocalClientConnected;
+        NetworkManager.Singleton.OnClientDisconnectCallback -= OnLocalClientFailed;
+    }
+
 
     // =========================================================================
     // OnNetworkSpawn — Subscribe to OnValueChanged callbacks
