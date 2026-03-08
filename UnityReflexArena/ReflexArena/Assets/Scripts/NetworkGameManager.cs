@@ -220,6 +220,7 @@ public class NetworkGameManager : NetworkBehaviour
                 transport.ConnectionData.Address = MainMenuManager.ChosenIP;
                 transport.ConnectionData.Port = 7777;
                 Debug.Log($"[Client] Attempting to connect to {MainMenuManager.ChosenIP}:7777");
+                Debug.Log($"[Client] Transport address set to: {transport.ConnectionData.Address}:{transport.ConnectionData.Port}");
                 NetworkManager.Singleton.OnClientConnectedCallback += OnLocalClientConnected;
                 NetworkManager.Singleton.OnClientDisconnectCallback += OnLocalClientFailed;
                 transport.DisconnectTimeoutMS = 10000;
