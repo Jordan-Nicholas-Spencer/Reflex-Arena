@@ -43,6 +43,7 @@ public class PocketSandEffect : MonoBehaviour
     private IEnumerator SandRoutine()
     {
         sandOverlay.SetActive(true);
+        if (AudioManager.Instance != null) AudioManager.Instance.PlaySandHit();
 
         // Set splotches to full opacity
         Color sandColor = new Color(0.71f, 0.59f, 0.35f, 0.8f);

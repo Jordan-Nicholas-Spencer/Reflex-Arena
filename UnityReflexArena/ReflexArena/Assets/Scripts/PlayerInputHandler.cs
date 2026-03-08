@@ -163,6 +163,7 @@ public class PlayerInputHandler : NetworkBehaviour
         }
 
         // FIRE! Spend a bullet
+        if (AudioManager.Instance != null) AudioManager.Instance.PlayShoot();
         currentBullets--;
         UpdateAmmoUI();
 
@@ -172,6 +173,7 @@ public class PlayerInputHandler : NetworkBehaviour
         // If that was the last bullet, immediately show reload prompt
         if (currentBullets <= 0)
         {
+            if (AudioManager.Instance != null) AudioManager.Instance.PlayEmptyGun();
             reloadTextObject.SetActive(true);
             reloadText.text = "RIGHT CLICK TO RELOAD!";
             reloadText.color = new Color(1f, 0.4f, 0.4f);
@@ -200,6 +202,8 @@ public class PlayerInputHandler : NetworkBehaviour
             {
                 // HIT! Remove locally
                 TargetManager.Instance.RemoveTarget(result.gameObject);
+                
+                if (AudioManager.Instance != null) AudioManager.Instance.PlayTargetHit();
 
                 // Report hit to server via RPC
                 // Pattern: Client action → Server RPC → Server updates NetworkVariable
@@ -257,6 +261,7 @@ public class PlayerInputHandler : NetworkBehaviour
             yield return new WaitForSeconds(perBullet);
             if (!isReloading) yield break; // Interrupted
             currentBullets++;
+            if (AudioManager.Instance != null) AudioManager.Instance.PlayBulletReload();
             UpdateAmmoUI();
         }
         isReloading = false;
@@ -275,6 +280,8 @@ public class PlayerInputHandler : NetworkBehaviour
         hasJamAbility = false;
         UpdateAbilityUI();
 
+        if (AudioManager.Instance != null) AudioManager.Instance.PlayJamSend();
+
         // Send jam request to server
         // Pattern: Client → [Rpc(SendTo.Server)] → Server validates → Server broadcasts effect
         NetworkGameManager.Instance.RequestJamRpc();
@@ -289,6 +296,7 @@ public class PlayerInputHandler : NetworkBehaviour
         StopReload(); // Cancel any reload
 
         reloadTextObject.SetActive(true);
+        if (AudioManager.Instance != null) AudioManager.Instance.PlayJamReceive();
         reloadText.text = "GUN JAMMED! CLICK TO CLEAR";
         reloadText.color = new Color(1f, 0.2f, 0.2f); // Red
     }
@@ -320,6 +328,8 @@ public class PlayerInputHandler : NetworkBehaviour
 
         hasSandAbility = false;
         UpdateAbilityUI();
+
+        if (AudioManager.Instance != null) AudioManager.Instance.PlaySandThrow();
 
         // Send sand request to server
         NetworkGameManager.Instance.RequestSandRpc();

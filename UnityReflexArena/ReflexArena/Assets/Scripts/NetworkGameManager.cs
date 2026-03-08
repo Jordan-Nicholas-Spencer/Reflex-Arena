@@ -176,8 +176,14 @@ public class NetworkGameManager : NetworkBehaviour
     // =========================================================================
     private void Start()
     {
-        playAgainButton.onClick.AddListener(OnPlayAgain);
-        quitToMenuButton.onClick.AddListener(OnQuitToMenu);
+        playAgainButton.onClick.AddListener(() => {
+            if (AudioManager.Instance != null) AudioManager.Instance.PlayButtonClick();
+            OnPlayAgain();
+        });
+        quitToMenuButton.onClick.AddListener(() => {
+            if (AudioManager.Instance != null) AudioManager.Instance.PlayButtonClick();
+            OnQuitToMenu();
+        });
 
         isSinglePlayer = MainMenuManager.IsSinglePlayer;
 
@@ -447,6 +453,7 @@ public class NetworkGameManager : NetworkBehaviour
         for (int i = 3; i >= 1; i--)
         {
             UpdateCountdownRpc(i.ToString());
+            PlayCountdownBeepRpc();
             yield return new WaitForSeconds(1f);
         }
 
@@ -458,6 +465,7 @@ public class NetworkGameManager : NetworkBehaviour
 
         // Start the round
         phase.Value = GamePhase.RoundActive;
+        PlayRoundStartRpc();
 
         // Tell all clients to spawn targets with the same seed
         SpawnTargetsRpc(count, seed);
@@ -734,5 +742,23 @@ public class NetworkGameManager : NetworkBehaviour
         if (NetworkManager.Singleton != null)
             NetworkManager.Singleton.Shutdown();
         SceneManager.LoadScene("MainMenu");
+    }
+
+    // =========================================================================
+    // SOUNDS
+    // =========================================================================
+
+    /// <summary>[Server → All Clients] Play countdown beep on all clients.</summary>
+    [Rpc(SendTo.ClientsAndHost)]
+    private void PlayCountdownBeepRpc()
+    {
+        if (AudioManager.Instance != null) AudioManager.Instance.PlayCountdownBeep();
+    }
+
+    /// <summary>[Server → All Clients] Play round start sound on all clients.</summary>
+    [Rpc(SendTo.ClientsAndHost)]
+    private void PlayRoundStartRpc()
+    {
+        if (AudioManager.Instance != null) AudioManager.Instance.PlayRoundStart();
     }
 }
